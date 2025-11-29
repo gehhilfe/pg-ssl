@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-ssl
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./certs/fullchain.pem:/etc/ssl/certs/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/ssl/private/privkey.pem:ro
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    command: >
+      postgres
+      -c ssl=on
+      -c ssl_cert_file=/etc/ssl/certs/fullchain.pem
+      -c ssl_key_file=/etc/ssl/private/privkey.pem
+      -c ssl_ca_file=/etc/ssl/certs/fullchain.pem
+      -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cert-watcher:
+    image: alpine:latest
+    container_name: postgres-cert-watcher
+    restart: unless-stopped
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    command: >
+      sh -c "
+        apk add --no-cache inotify-tools postgresql-client &&
+        echo 'Waiting for PostgreSQL to be ready...' &&
+        until PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h postgres -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -c 'SELECT 1;' >/dev/null 2>&1; do
+          sleep 1
+        done &&
+        echo 'Watching certificate files for changes...' &&
+        while true; do
+          inotifywait -e modify,create,delete,attrib /certs/fullchain.pem /certs/privkey.pem 2>/dev/null &&
+          echo 'Certificate files changed. Reloading PostgreSQL configuration...' &&
+          PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h postgres -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -c 'SELECT pg_reload_conf();' 2>/dev/null &&
+          echo 'PostgreSQL configuration reloaded successfully. New certificates will be used for new connections.' ||
+          echo 'Warning: Failed to reload configuration. New certificates may require a restart.' &&
+          sleep 2
+        done
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
